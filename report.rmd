@@ -1,0 +1,713 @@
+---
+title: "Analysis of the organization model of UK civil aviation network"
+author: "Haode Sun"
+output:
+  html_document:
+    df_print: paged
+always_allow_html: yes
+header-includes:
+- \usepackage{graphicx}
+- \usepackage{float}
+- \usepackage{subfig}
+- \usepackage{fancyhdr}
+- \pagestyle{fancy}
+- \lhead{Student ID 201606611}
+- \chead{}
+- \rhead{TRAN5340M Transport Data Science}
+- \fancypagestyle{plain}{\pagestyle{fancy}}
+bibliography: references.bib
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+	echo = TRUE,
+	fig.align = "center",
+	fig.pos = "H",
+	out.width = "100%"
+)
+ 
+
+```
+
+# 1.Introduction
+
+Aviation networks are a typical class of complex networks that are important research topics in transport as a vehicle for the realisation of air transport. Understanding airline networks is essential for understanding the relative importance of airports, the structural composition of the network and possible vulnerabilities, as well as aiding epidemiological research, as the spread of disease is closely linked to people's travel patterns, in addition to the close relationship between air cargo volumes and income and employment in metropolitan areas [@button2013airfreight]. If major hubs in the network are disrupted, this can significantly impact the network as a whole. Optimising the network pattern can inform airlines' decisions on new route openings, flight schedules, etc. and avoid unhealthy competition between firms.
+
+This project analyses the UK passenger airline network, measuring airport connectivity in terms of three indicators: degree centrality, betweenness centrality and closeness centrality, and simulates route reorganisation using Dijkstra's algorithm to compare the network after Gatwick replaces Heathrow, and finally provides a descriptive analysis of the route coverage of different airports in the perspective of airline companies, providing a reference for the development of UK aviation.
+
+# 2. Data acquisition and processing
+
+The data for this project is divided into two main parts: UK route data and airport data.
+
+```{r load_packages, echo=TRUE, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(httr)
+library(jsonlite)
+library(lubridate)
+library(data.table)
+library(readxl)
+library(sf)
+library(dplyr)
+library(ggmap)
+library(readr)
+library(igraph)
+library(ggplot2)
+library(scatterpie)
+library(ggsci)
+library(rgdal)
+library(rcartocolor)
+library(knitr)
+
+
+```
+
+## 2.1 Route Data
+
+The civil airline route data was obtained from Opensky's dataset, and I chose the time range from January 10, 2022, to January 24, 2022, in order to avoid the influence of holidays. First, I wrote the URL to get the route data in a specific period according to the API documentation and then used GET requests to get the OpenSky API to crawl the flight data for two weeks, where the routes included all domestic and international routes. Using this as the research basis for this project, the flight data only involved direct routes, excluding stopovers and connections. The obtained dataset information includes ICAO 24, expected flight departure time, ICAO code of desired departure airport, expected flight arrival time, ICAO code of expected arrival airport, callsign and other main information.
+
+Since the interval between Opensky's API requests cannot exceed two hours, I set the interval_size to 2, which means I only can get the data every two hours. To make it easier to get it, I use the as. numeric() function to convert the current date and time to UNIX timestamp and finally overlay it together using the while loop.
+
+```{r #crawl_route_data_from_Opensky, echo=TRUE}
+username <- "sevensun"
+password <- "Jinluyi862"
+url <- "https://opensky-network.org/api/flights/all"
+
+start_datetime <- as.POSIXct("2022-01-10", tz = "GMT")
+end_datetime <- as.POSIXct("2022-01-24", tz = "GMT")
+interval_size <- 2 * 60 * 60  # 2 hours in seconds
+# Initialize an empty data frame to store the combined results
+df_combined <- data.frame()
+
+# Iterate over the time range in two-hour intervals
+current_datetime <- start_datetime
+while (current_datetime < end_datetime) {
+# Calculate the start and end timestamps for the current interval
+  current_start <- as.numeric(current_datetime)
+  current_end <- as.numeric(current_datetime + interval_size)
+  
+# Make the request
+  response <- GET(url, 
+                  query = list(begin = current_start, end = current_end), 
+                  authenticate(username, password, type = "basic"))
+  stop_for_status(response)
+  
+# Convert the response JSON to a data frame
+  data <- fromJSON(content(response, "text"), flatten = TRUE)
+  df_current <- as.data.frame(data)
+  
+# Append the current interval's data to the combined data frame
+  df_combined <- bind_rows(df_combined, df_current)
+  
+# Move to the next interval
+  current_datetime <- current_datetime + interval_size
+}
+
+# Print the combined data frame
+print(df_combined)
+write.csv(df_combined, file = "allairlinedata.csv", row.names = FALSE)
+
+
+```
+
+## 2.2 Airport Data
+
+Regarding the selection of airports, most are from the Reported airport of the UK Department for Transport and Civil Aviation Authority (the airports that submit individual records of each air transport to the CAA). After integration, some airports with missing data, few routes and single destinations (e.g., some airlines have only Glasgow Airport as their route destination) were eliminated based on the route data provided by OpenSky. Most of the large and medium-sized airports were retained. Finally, the filtered airports were connected based on the latitude and longitude data provided by OpenFlights ([Github link](https://raw.githubusercontent.com/jpatokal/openflights/master/data/airports.dat)) to obtain their latitude and longitude for further The study was conducted.
+
+```{r #Organize airport data, echo=TRUE}
+#Read excel
+uk_airports <- read_excel("Data/uk airports.xlsx")
+#download all airports information from openflights
+download.file("https://raw.githubusercontent.com/jpatokal/openflights/master/data/airports.dat", 
+              destfile = "airports.dat", mode = "wb")
+# Import data
+airports <- fread("airports.dat", sep = ",")
+
+#Data wrangling
+# Assign new column names
+airports <- rename(airports, number = 1, airport_name = 2, city = 3,country = 4,IATA = 5,ICAO = 6,latitude = 7,longitude = 8)
+#join two data together
+uk_airports <- inner_join(airports, uk_airports, by = "IATA")
+# delete columns
+uk_airports <- uk_airports[, -c(1, 4, 9, 10, 11, 12, 13, 14, 17)]
+#modify the column name
+uk_airports <- rename(uk_airports, ICAO = 4)
+#save file
+write.csv(uk_airports, "uk_airports.csv", row.names = FALSE)
+
+
+```
+
+## 2.3 UK map data
+
+I downloaded the shapefile format data of Local_Authority_Districts from the Office of National Statistics as the basis for drawing the map. I used ArcGIS to merge all the regions into one piece as the base map for visualisation.Figure 1 is the distribution map of 26 airports in the UK.
+
+```{r #Plot distribution map of UK, echo=TRUE}
+#read files
+uk_map <- read_sf("C:/Users/Lenovo/Desktop/Course/TRAN5340M Transport Data Science (33793)/Final coursework/final/DataLAD_MAY_2023_UK_BFC.shp")
+
+uk_airports <- read.csv('Data/uk_airports.csv')
+
+airport1 <- uk_airports
+airport1$longitude <- uk_airports$longitude-0.2
+airport1$latitude <- uk_airports$latitude-0.2
+airport1[airport1$Airport.name=='Manchester',]$longitude <- uk_airports[airport1$Airport.name=='Manchester',]$longitude-0.1
+airport1[airport1$Airport.name=='Belfast International',]$longitude <- uk_airports[airport1$Airport.name=='Belfast International',]$longitude-0.1
+
+projcrs <- "+proj=longlat +datum=WGS84 +no_defs +ellps=WGS84 +towgs84=0,0,0"
+df <- st_as_sf(x = uk_airports,                         
+               coords = c("longitude", "latitude"),
+               crs = projcrs)
+df1 <- st_as_sf(x = airport1,                         
+                coords = c("longitude", "latitude"),
+                crs = projcrs)
+#plot the distribution of UK airports
+ggplot() + 
+  geom_sf(data=uk_map)+
+  geom_sf(data=df,aes(color=type),size = 6)+
+  geom_sf_text(data=df1,
+               aes(label=Airport.name),
+               size=5.5)+
+  scale_color_manual(values=c('darkred','steelblue'))+
+  theme_bw()
+ggsave('uk airports.png',height=25,width=17.5)
+
+
+
+```
+
+```{r display_figure_1, echo=TRUE, fig.cap="uk-airports", out.height="70%", out.width="50%"}
+
+include_graphics("Figures/uk_airports.png")
+
+```
+
+# 3. Airport hubs and connectivity
+
+## 3.1 Network building
+
+Based on Graph Theory's adjacency matrix theory, the UK air transport network was constructed for 3331 routes, 26 airports and ten airlines before the analysis. A relational data matrix (Figure 2) among all airport nodes involved was first built to calculate the connectivity of each airport as a departure and arrival airport, respectively (Before conducting the analysis, for the route network of 10 airlines, first build n relational data matrix among airport nodes).
+
+```{r #Create directed graph, echo=TRUE}
+data <- read.csv("Data/data.csv")
+# Replace missing values in estDepartureAirport and estArrivalAirport with "UNKNOWN"
+data$estDepartureAirport[is.na(data$estDepartureAirport)] <- "UNKNOWN"
+data$estArrivalAirport[is.na(data$estArrivalAirport)] <- "UNKNOWN"
+#Create an empty directed graph object
+graph <- graph.empty()
+nodes <- unique(c(data$estDepartureAirport, data$estArrivalAirport))
+graph <- add.vertices(graph, length(nodes))
+V(graph)$name <- nodes
+edges <- cbind(match(data$estDepartureAirport, nodes),
+               match(data$estArrivalAirport, nodes))
+graph <- add.edges(graph, edges)
+#plot
+plot(graph, vertex.label=V(graph)$name)
+
+
+```
+
+```{r display_figure_2, echo=TRUE, fig.cap="Network-analysis-map", out.width="50%"}
+
+include_graphics("Figures/Network_analysis_map.png")
+
+```
+
+Centrality metrics are commonly used to rank network nodes according to their topological importance [@BavelasAlex1948AMMF]. In the following, we analyse routes using the three metrics of network analysis: degree centrality, betweenness centrality and closeness centrality.
+
+```{r #calculate degree centrality, betweenness centrality and closeness centrality}
+
+# Calculate the degree centrality of a node
+degree_centrality <- degree(graph, mode = "all")
+normalized_degree_centrality <- degree_centrality / (vcount(graph) - 1)
+
+# Calculate the betweenness centrality of a node
+betweenness_centrality <- betweenness(graph, v = V(graph), directed = FALSE, nobigint = TRUE)
+normalized_betweenness_centrality <- betweenness_centrality / ((vcount(graph) - 1) * (vcount(graph) - 2) / 2)
+
+# Calculate the closeness centrality of a node
+closeness_centrality <- closeness(graph, vids = V(graph), mode = "all")
+normalized_closeness_centrality <- closeness_centrality * (vcount(graph) - 1)
+
+# create table
+
+results <- data.frame(
+  ICAO = nodes,
+  degree_centrality = degree_centrality,
+  normalized_degree_centrality = normalized_degree_centrality,
+  betweenness_centrality = betweenness_centrality,
+  normalized_betweenness_centrality = normalized_betweenness_centrality,
+  closeness_centrality = closeness_centrality,
+  normalized_closeness_centrality = normalized_closeness_centrality
+)
+
+print(results)
+
+# Join using ICAO 24 columns as join keys
+merged_data <- merge(results, uk_airports, by = "ICAO")
+# save data
+write.csv(merged_data, "merged_data.csv", row.names = FALSE)
+
+```
+
+## 3.2 Degree Centrality
+
+In an airline network, the greater the degree of an airport, the higher the degree centrality of that airport, which means that it is more critical in the network. In simple terms, degree centrality is some function of the degree of a point [@FreemanLintonC.1979Cisn].
+
+```{r #plot degree centrality histogram}
+
+#plot histogram
+library(ggplot2)
+#degree centrality
+# Sort results by degree centrality in descending order
+results <- results[order(-results$degree_centrality), ]
+
+# Get top 5 Degree Centrality
+top5dc <- merged_data %>% 
+  top_n(5, degree_centrality) 
+
+# Sort ICAO by degree_centrality from large to small
+top5dc$IATA <- factor(top5dc$IATA, levels = top5dc$IATA[order(-top5dc$degree_centrality)])
+
+# plot
+ggplot(top5dc, aes(x=degree_centrality, y=IATA, fill=IATA)) +
+  geom_bar(stat="identity") +
+  geom_text(aes(label=degree_centrality), vjust=-0.3, size=3.5) +
+  scale_fill_brewer(palette="Set1") +
+  coord_flip() +
+  guides(fill=FALSE) +
+  xlab("Degree Centrality") +
+  ylab("Airport Name") +
+  ggtitle("Top 5 Airports by Degree Centrality")
+
+
+```
+
+## 3.3 Betweenness Centrality
+
+Betweenness centrality measures the role of a particular node in a network as a broker[@SONG2017117]. It is the number of times a node acts as the shortest bridge between two other nodes, i.e. the number of times an airport serves as a connection point between two different airports. The higher the number of shortest paths through this point, the higher the intermediary centrality of that airport, meaning that this airport is likely to be a significant hub airport.
+
+```{r #plot betweenness centrality histogram}
+
+#Get top 5 Betweenness Centrality
+top5bc <- merged_data %>% 
+  top_n(5, betweenness_centrality) 
+
+# Round betweenness_centrality to 3 decimal places
+top5bc$betweenness_centrality <- round(top5bc$betweenness_centrality, 3)
+
+# Sort ICAO by betweenness_centrality from large to small
+top5bc$IATA <- factor(top5bc$IATA, levels = top5bc$IATA[order(-top5bc$betweenness_centrality)])
+
+# plot
+ggplot(top5bc, aes(x=betweenness_centrality, y=IATA, fill=IATA)) +
+  geom_bar(stat="identity") +
+  geom_text(aes(label=betweenness_centrality), vjust=-0.3, size=3.5) +
+  scale_fill_brewer(palette="Set1") +
+  coord_flip() +
+  guides(fill=FALSE) +
+  xlab("Betweenness Centrality") +
+  ylab("Airport Name") +
+  ggtitle("Top 5 Airports by Betweenness Centrality")
+
+
+```
+
+## 3.4 Closeness Centrality
+
+Closeness centrality requires consideration of the average length of the shortest path from each node to the other nodes. For an airport, the closer it is to other airports, the more central it is.
+
+```{r #plot closeness centrality histogram}
+
+#Get top 5 Closeness Centrality
+top5cc <- merged_data %>% 
+  top_n(5, closeness_centrality) 
+
+# Round closeness_centrality to 4 decimal places
+top5cc$closeness_centrality <- round(top5cc$closeness_centrality, 5)
+
+# Sort ICAO by closeness_centrality from large to small
+top5cc$IATA <- factor(top5cc$IATA, levels = top5cc$IATA[order(-top5cc$closeness_centrality)])
+
+# plot
+ggplot(top5cc, aes(x=closeness_centrality, y=IATA, fill=IATA)) +
+  geom_bar(stat="identity") +
+  geom_text(aes(label=closeness_centrality), vjust=-0.3, size=3.5) +
+  scale_fill_brewer(palette="Set1") +
+  coord_flip() +
+  guides(fill=FALSE) +
+  xlab("Closeness Centrality") +
+  ylab("Airport Name") +
+  ggtitle("Top 5 Airports by Closeness Centrality")
+
+
+
+```
+
+## 3.5 Analysis and Findings
+
+```{r display_figure_3, fig.cap="Top-5-Airports-by-Degree-Centrality", eval=TRUE, echo=FALSE, include=TRUE, out.width="50%"}
+
+include_graphics("Figures/Top_5_Airports_by_Degree_Centrality.png")
+
+```
+
+```{r display_figure_4, fig.cap="Top-5-Airports-by-Betweenness-Centrality", eval=TRUE, echo=FALSE, include=TRUE, out.width="50%"}
+
+include_graphics("Figures/Top_5_Airports_by_Betweenness_Centrality.png")
+
+```
+
+```{r display_figure_5, fig.cap="Top-5-Airports-by-Closeness-Centrality", eval=TRUE, echo=FALSE, include=TRUE, out.width="50%"}
+
+include_graphics("Figures/Top_5_Airports_by_Closeness_Centrality.png")
+
+```
+
+Based on the above, I calculated the degree centrality, betweenness centrality and closeness centrality for 26 airports based on 3,331 routes of 10 airlines and selected the top five airports for each indicator to visualise. The result is shown in Figure 3, Figure 4 and Figure 5.
+
+Firstly, it is worth mentioning that London Heathrow is in first place in all three indicators, meaning that it occupies a key position in the airline network, with a high number of connections and important relay points as the shortest route between other airports. It is the most accessible airport in the UK airline network to all other airports.
+
+In terms of degree centrality, Belfast International Airport is in second place with 540, followed by Edinburgh Airport (449), London Gatwick Airport (385) and Glasgow International Airport (350), respectively. Two of the top five airports are located in Scotland and England (London) and one is in Northern Ireland, all of which are large airports. Regarding betweenness centrality, in second place remains Belfast International Airport, with Manchester Airport in the middle of the UK in third place, followed by Glasgow International Airport and Edinburgh Airport in Scotland.
+
+In the results of degree centrality and betweenness centrality, the value of the second place is very different from the value of the first place, and the value of the second place is less than one-half of the first place. However, the difference between the second, third, fourth and fifth places is not very big. Except for London Heathrow, these airports are more similar in their positions and roles in the network; all of them are airports with specific scale and importance, but they are slightly less influential and critical compared to the first-ranked airport.
+
+However, the top five airports do not differ significantly in their closeness centrality values, ranging from London Heathrow in the first place to London Gatwick in fifth place, by only about 0.07, suggesting that these airports have great flight connections that provide easy and quick access to other airports in the network.
+
+In summary, based on the above calculations of degree centrality, betweenness centrality and closeness centrality, London Heathrow is a central aviation hub in the UK with many daily flights in and out and plays a key relay role in the overall UK aviation network.
+
+# 4. Exploratory analysis of LHR
+
+London Heathrow Airport, located 14 miles west of central London, is the UK's number one airport, with connections to hundreds of destinations worldwide.
+
+But Heathrow's reliance on foreign hubs is weakening its position in the overall global aviation network because when only regional markets are considered, significant dependence on foreign hubs appears in many destinations, particularly Asia--Pacific or the BRIC countries where above 80% of passengers use transfer flights [@Suau-SanchezPere2016TroL]. While UK regions are already well-connected to many European destinations with the development of low-cost airlines, their weak position in the UK city hierarchy limits their ability to receive direct air services to intercontinental destinations, and The added value they bring [@ShinKyoung-Ho2000WCiA; @HallPeter2009LBLF; @BentlageMichael2013KciG].
+
+It is difficult to imagine the status of Heathrow Airport in the future. For these reason, we chose Gatwick Airport as an alternative hub for Heathrow, and explored if Heathrow Airport does not exist, whether there are other airports that can undertake huge traffic The air transport business of the airport also indirectly develops a second airport to take over a large number of international routes, thereby helping to reduce the loss of passengers to London.
+
+## 4.1 Methodology
+
+Based on the above conditions, we assume that Gatwick Airport is selected, and then use the igraph and Dijkstra algorithm to view the shortest path from Gatwick Airport to all other airports in the event that London Heathrow Airport is demolished. Use filter() to filter out all routes involving Heathrow Airport and delete them, then create a new directed graph object, the same as the above steps to create a network, set the weight of the edge to 1, set the start_node to Gatwick Airport and Calculate the shortest path using Dijkstra's algorithm. Based on the calculated results, a new network is constructed for airport connectivity evaluation.
+
+```{r #calculate and plot the new network map}
+ 
+#Read Csv
+data1 <- read.csv("Data/data.csv")
+#fill missing values
+data1$estDepartureAirport[is.na(data$estDepartureAirport)] <- "UNKNOWN"
+
+data1$estArrivalAirport[is.na(data$estArrivalAirport)] <- "UNKNOWN"
+#Delete all routes involving Heathrow
+data1<- data1 %>%
+  filter(estDepartureAirport != "EGLL", estArrivalAirport != "EGLL")
+#load library
+library(igraph)
+# Create an empty directed graph object
+g <- graph.empty()
+
+# add node (airport)
+nodes <- unique(c(data1$estDepartureAirport, data1$estArrivalAirport))
+g <- add.vertices(g, nv = length(nodes))
+V(g)$name <- nodes
+
+# Add route data to graph
+edges <- cbind(match(data1$estDepartureAirport, V(g)$name),
+               match(data1$estArrivalAirport, V(g)$name))
+g <- add.edges(g, edges)
+
+# Set the edge weight to 1
+E(g)$weight <- 1
+
+# Set origin to Gatwick Airport
+start_node <- "EGKK"  
+
+# Calculating the shortest path from Gatwick to other airports using Dijkstra's algorithm
+shortest_paths <- shortest_paths(g, from = start_node, to = V(g)$name, mode = "out")
+
+# print results
+for (i in 1:length(V(g)$name)) {
+  dest <- V(g)$name[i]
+  if (dest != start_node) {
+    path <- shortest_paths$vpath[[i]]
+    print(paste("Shortest path from Gatwick to", dest, ":", paste(path, collapse = " -> ")))
+  }
+}
+
+#Reconfigure the network
+# Create an empty directed graph object
+new_graph <- graph.empty(n = length(nodes))
+V(new_graph)$name <- nodes
+edges <- cbind(match(data1$estDepartureAirport, nodes),
+               match(data1$estArrivalAirport, nodes))
+new_graph <- add.edges(new_graph, edges)
+
+plot(new_graph, vertex.label=V(new_graph)$name)
+
+```
+
+```{r #calculate the new network map degree centrality, betweenness centrality and closeness centrailty}
+ 
+# Calculate the degree centrality of the new node
+degree_centrality <- degree(new_graph, mode = "all")
+normalized_degree_centrality <- degree_centrality / (vcount(new_graph) - 1)
+
+# Calculate the betweenness centrality of the new node
+betweenness_centrality <- betweenness(new_graph, v = V(new_graph), directed = FALSE)
+normalized_betweenness_centrality <- betweenness_centrality / ((vcount(new_graph) - 1) * (vcount(new_graph) - 2) / 2)
+
+# Calculate the closeness centrality of the new node
+closeness_centrality <- closeness(new_graph, vids = V(new_graph), mode = "all")
+normalized_closeness_centrality <- closeness_centrality * (vcount(new_graph) - 1)
+
+# Bind and sort results with node names
+centrality_with_names <- setNames(degree_centrality, V(new_graph)$name)
+sorted_centrality_with_names <- sort(centrality_with_names, decreasing = TRUE)
+
+# Display the top five nodes with the highest degree centrality
+top_five_degree_centrality <- head(sorted_centrality_with_names, n = 5)
+print(top_five_degree_centrality)
+
+#Only UK airports
+# Bind and sort results with node names
+centrality_with_names <- setNames(betweenness_centrality, V(new_graph)$name)
+sorted_centrality_with_names <- sort(centrality_with_names, decreasing = TRUE)
+
+# Display the top five nodes with the highest betweenness centrality
+top_five_betweenness_centrality <- head(sorted_centrality_with_names, n = 5)
+print(top_five_betweenness_centrality)
+
+# Bind and sort results with node names
+centrality_with_names <- setNames(closeness_centrality, V(new_graph)$name)
+sorted_centrality_with_names <- sort(centrality_with_names, decreasing = TRUE)
+
+# Display the top five nodes with the highest closeness centrality
+top_five_closeness_centrality <- head(sorted_centrality_with_names, n = 6)
+print(top_five_closeness_centrality)
+
+```
+
+## 4.2 Results and Discussions
+
+```{r display_figure_6, fig.cap="New-Network-analysis-map", eval=TRUE, echo=FALSE, include=TRUE, out.width="50%"}
+
+include_graphics("Figures/New_Network_analysis_map.png")
+
+```
+
+A new aviation network matrix has been created (Figure 6). Following the closure of Heathrow, Belfast International Airport, the most connected airport in the new network, has seen a drop in connectivity compared to the highest airport in the old network (ie Heathrow). Even though it has the highest degree centrality in the new network, it is only half as connected as Heathrow. But as closeness centrality has improved in the new network, if routes between airports are more optimally organized after Heathrow closes, the average flight distance between any two airports will be shorter.
+
+Table 1: Degree centrality comparison
+
+|            Airport            | Degree centrality |            Airport            | New Degree centrality |
+|:----------------:|:----------------:|:----------------:|:----------------:|
+|    London Heathrow Airport    |       1175        | Belfast International Airport |          539          |
+| Belfast International Airport |        540        |    London Gatwick Airport     |          357          |
+|       Edinburgh Airport       |        449        |       Edinburgh Airport       |          315          |
+|    London Gatwick Airport     |        385        | Glasgow International Airport |          262          |
+| Glasgow International Airport |        350        |      Manchester Airport       |          244          |
+
+Table 2: Betweenness centrality comparison
+
+|            Airport            | Betweenness centrality |            Airport            | New Betweeness centrality |
+|:----------------:|:----------------:|:----------------:|:----------------:|
+|    London Heathrow Airport    |        1128.796        | Belfast International Airport |         655.5115          |
+| Belfast International Airport |        447.5315        |      London City Airport      |         310.3420          |
+|      Manchester Airport       |        429.2433        |       Edinburgh Airport       |         296.4661          |
+| Glasgow International Airport |        403.8832        |      Birmingham Airport       |         290.7720          |
+|       Edinburgh Airport       |        392.8011        |     Belfast City Airport      |         280.5672          |
+
+Table 3: Closeness centrality comparison
+
+|            Airport            | Closeness centrality |            Airport            | New Closeness centrality |
+|:----------------:|:----------------:|:----------------:|:----------------:|
+|    London Heathrow Airport    |      0.0078740       | Belfast International Airport |        0.0091743         |
+|       Edinburgh Airport       |      0.0074626       |    London Gatwick Airport     |        0.0088495         |
+|      Manchester Airport       |      0.0074074       |       Edinburgh Airport       |        0.0085470         |
+| Glasgow International Airport |      0.0073529       | Glasgow International Airport |        0.0084745         |
+|       Edinburgh Airport       |      0.0072992       |      Manchester Airport       |        0.0084745         |
+
+According to the comparison of the airport connectivity indicators given in the three tables (Table 1, Table 2 and Table 3),While Belfast International Airport surpasses Gatwick in the new network for degree centrality, betweenness centrality and proximity centrality, Gatwick ranks mid-point for degree centrality and proximity centrality It ranks second, indicating that it is still connected to many important airports, which means that it is still a very important node. Given Gatwick's location, demographics and economics, even though it doesn't have as much airport connectivity as Belfast, that doesn't mean it can't serve as a valid alternative. But while Gatwick (or any other airport for that matter) might be the best alternative, it still can't fully replace Heathrow's functions.
+
+# 5. Airline analysis
+
+## 5.1 Methodology
+
+The previously collated route data was used to calculate the number of airports involved and the total number of routes for each airline using the functions group_by(), mutate() and summarize(), as well as the proportion of each airline's routes to each airport. Finally, the UK map shapefile data was read and the percentage of routes for each airline at each airport was visualised using ggplot().
+
+```{r #Calculate the proportion of airline routes for each airport}
+#Read Csv
+airlinedata <- read.csv("Data/data.csv")
+
+# Create new column ICAO 24 that consists of the first three letters of callsign
+airlinedata$ICAO24 <- substr(airlinedata$callsign, 1, 3)
+
+# Replace missing values in estDepartureAirport and estArrivalAirport with "UNKNOWN"
+airlinedata$estDepartureAirport[is.na(data$estDepartureAirport)] <- "UNKNOWN"
+airlinedata$estArrivalAirport[is.na(data$estArrivalAirport)] <- "UNKNOWN"
+
+# Count the number of flights departing from each airport for each airline
+departure_counts <- airlinedata %>%
+  group_by(ICAO24, estDepartureAirport) %>%
+  summarise(departures = n(), .groups = 'drop')
+
+# Count the number of flights arriving to each airport for each airline
+arrival_counts <- airlinedata %>%
+  group_by(ICAO24, estArrivalAirport) %>%
+  summarise(arrivals = n(), .groups = 'drop')
+
+# Combine departure and arrival counts
+airport_airline_counts <- full_join(departure_counts, arrival_counts, 
+                                    by = c("ICAO24", "estDepartureAirport" = "estArrivalAirport"))
+
+# If an airline/airport has no departures or arrivals, fill NA values with 0
+airport_airline_counts <- replace_na(airport_airline_counts, list(departures = 0, arrivals = 0))
+
+# Calculate total routes per airport for each airline
+airport_airline_counts$total_routes <- airport_airline_counts$departures + airport_airline_counts$arrivals
+
+#Filter routes from UK airports
+airport_codes <- c("EGAA", "EGAC", "EGBB", "EGCC", "EGFF", "EGGD", "EGGP", "EGGW", "EGHH", "EGHI", "EGHQ", "EGKK", "EGLC", "EGLL", "EGNJ", "EGNM", "EGNT", "EGNX", "EGPD", "EGPE", "EGPF", "EGPH", "EGPK", "EGSH", "EGSS", "EGTE")
+
+uk_airline_counts <- airport_airline_counts %>%
+  filter(estDepartureAirport %in% airport_codes)
+#rename 
+uk_airline_counts <- rename(uk_airline_counts, ICAO = estDepartureAirport)
+
+#Organize the table, set it to 0 for airports with no airline connection
+# List of all ICAOs
+all_ICAOs <- c("EGAA", "EGAC", "EGBB", "EGCC", "EGFF", "EGGD", "EGGP", "EGGW", "EGHH", "EGHI", "EGHQ", "EGKK", "EGLC", "EGLL", "EGNJ", "EGNM", "EGNT", "EGNX", "EGPD", "EGPE", "EGPF", "EGPH", "EGPK", "EGSH", "EGSS", "EGTE")
+
+# All unique ICAO24 values
+all_ICAO24s <- unique(uk_airline_counts$ICAO24)
+
+# Use complete to ensure every combination of ICAO24 and ICAO exists
+uk_airline_counts <- uk_airline_counts %>%
+  complete(ICAO24 = all_ICAO24s, ICAO = all_ICAOs, fill = list(departures = 0, arrivals = 0, total_routes = 0))
+
+#Count the number of airports involved and the total number of routes for each airline
+uk_airline_stats <- uk_airline_counts %>%
+  group_by(ICAO24) %>%
+  summarise(num_airports = n(),
+            total_routes = sum(total_routes))
+
+#Calculate each airline's share of the airport `
+#Calculate the total number of routes for each airport
+airport_total_routes <- uk_airline_counts %>%
+  group_by(ICAO) %>%
+  summarize(total_routes_airport = sum(total_routes), .groups = 'drop')
+
+# Add the calculation result to uk_airline_counts
+uk_airline_counts <- merge(uk_airline_counts, airport_total_routes, by = "ICAO")
+
+# Then, calculate the ratio of each airline's flights to the total number of airport routes
+uk_airline_counts <- uk_airline_counts %>%
+  mutate(proportion = total_routes / total_routes_airport)
+
+# Make sure that the sum of all newly calculated proportions is 1
+uk_airline_counts <- uk_airline_counts %>%
+  group_by(ICAO) %>%
+  mutate(proportion = proportion / sum(proportion), .groups = 'drop')
+
+#merged the uk_airline_counts with airport longitude and latitude
+# Select only the columns needs
+airports_subset <- airports %>% select(ICAO, latitude, longitude)
+# Merge with the airports_subset data to get the latitude and longitude for each airport
+airport_route_data <- merge(uk_airline_counts, airports_subset, by = "ICAO")
+
+write.csv(airport_route_data, file = "airport_route_data.csv", row.names = FALSE)
+
+
+```
+
+```{r #Plot the proportion of airline routes for each airport}
+# Import your shapefile 
+uk_map <- read_sf("C:/Users/Lenovo/Desktop/Course/TRAN5340M Transport Data Science (33793)/Final coursework/final/Data/LAD_MAY_2023_UK_BFC.shp")
+
+# Create the base map
+library(sf)
+library(ggplot2)
+library(scatterpie)
+library(tidyverse)
+library(ggsci)
+library(rgdal)
+library(rcartocolor)
+
+cols=carto_pal(12, "Safe")
+
+uk_map <- sf::st_transform(uk_map, "WGS84")
+
+routedata <- airport_route_data %>%
+  select(ICAO,ICAO24,proportion,longitude,latitude,total_routes_airport) %>%
+  spread(key='ICAO24',value='proportion')
+
+#plot
+ggplot() + 
+  geom_sf(data=uk_map,fill='white')+
+  coord_sf(lims_method = "geometry_bbox", crs = st_crs(uk_map)) +
+  geom_scatterpie(aes(x=longitude, y=latitude, group = ICAO, size=total_routes_airport), 
+                  data = routedata, cols = colnames(routedata[,c(5:16)]), color=NA)+
+  scale_fill_manual(values=cols)+
+  theme_void()+
+  labs(x='Longitude',y='Latitude',fill='Airline')+
+  theme(text = element_text(size=20),
+        legend.text = element_text(size = 30))+
+  guides(size='none')
+
+#Save the picture
+ggsave('Proportion of Airport Flights.png',height=30,width=25)
+
+
+
+```
+
+## 5.2 Results and Discussions
+
+Based on the 3331 routes of 10 airlines, I calculated the number of British airports and the total number of routes involved in each airline, which can effectively reflect the importance of airlines in the British aviation network. The results are shown in table 4.
+
+Table 4: Airline Details
+
+|         Airline         |  ICAO   | Airports Involved | Number of Routes |
+|:-----------------------:|:-------:|:-----------------:|:----------------:|
+|       Aer Lingus        |   EIN   |         8         |       482        |
+|     British Airways     | BAW/SHT |        14         |       1495       |
+|      BA CityFlyer       |   CFE   |        10         |       345        |
+|     Eastern Airways     |   EZE   |        13         |        62        |
+|         EasyJet         |   EZY   |        16         |       2083       |
+|          Jet2           |   EXS   |        11         |        82        |
+|    Loganair Airways     |   LOG   |         6         |       133        |
+|      Titan Airways      |   AWC   |         6         |       125        |
+|       TUI Airways       |   TOM   |        13         |        92        |
+| Virgin Atlantic Airways |   VIR   |         2         |        18        |
+|        Wizz Air         |   WUK   |         2         |        6         |
+
+Based on the number of airports involved, the airline with the most airports covered is EasyJet, the UK's largest low-cost airline, with 16 UK airports, in addition to British Airways (14), Eastern Airways (13), TUI Airways (13) and BA Cityflyer (10). Jet2 (11) and BA Cityflyer (10). Airlines with less than 10 airports are Aer Lingus, Loganair Airways, Titan Airways, Virgin Atlantic Airways and Wizz Air.
+
+Regarding routes, EasyJet is in first place with 2083 routes and British Airways is in second place with 1495, the only two airlines of these 10 airlines with more than 1000 routes. Routes in the 100-1000 range are Aer Lingus, BA Cityflyer, Loganair Airways, Titan Airways, TUI Airways, Jet2, Eastern Airways, Virgin Atlantic Airways and Wizz Air with 92, 82 and 62 routes respectively. TUI Airways, Jet2, Eastern Airways, Virgin Atlantic Airways and Wizz Air are in the less than 100 tier with 92, 82, 62, 18 and 6 routes respectively.
+
+Each airport in the UK has a number of airline routes, and the cities and distribution of the routes will vary with the size and importance of the cities. This project calculates the proportion of each airline company in the airport routes of ten airline companies, and analyzes the distribution ratio of airline companies based on the degree of external connection of the airport, as shown in Figure 7.
+
+```{r display_figure_7, fig.cap="Proportion-of-Airport-Flights", eval=TRUE, echo=FALSE, include=TRUE, out.width="50%"}
+
+include_graphics("Figures/Proportion_of_Airport_Flights.png")
+
+```
+
+It is not difficult to find that Easyjet has a large market share in most airports in the UK from Figure 7, with a coverage rate of up to 70%. But there are also a few airports Newquay, Exeter, Bournemouth and Southampton that are not covered in the southwest of England, and the dominant position is replaced by Eastern Airway. The airports in northern England involve a variety of aviation companies, involving up to 8 airlines, including Easyjet, Virgin Atlantic Airways, Titan Airways, Eastern Airways, Loganair Airways, British Airways, Aer Lingus and Jet2. Among them, Jet2's routes at Leeds Bradford Airport account for more than all other airports. In the Scottish region, TUI Airways and British Airways are the airlines with a larger share except Easyjet, with a coverage rate of more than 25%. Others involved include Loganair Airways, Aer Lingus, BA CityFlyer and Titan Airways. In Northern Ireland, apart from Easyjet, BA CityFlyer, Aer Lingus and TUI Airways are in a strong position.
+
+Among the six airports in the top five of the three indicators of airport connectivity, Manchester Airport ranked first with 8 airlines covered, followed by Edinburgh and London Gatwick with 7 airlines, Glasgow International Airport, London Hope Throw Airport and Belfast International Airport involve 6, 4 and 4 airlines respectively.
+
+# 6. Limitation and Discussion
+
+Of course the project has many shortcomings. The first is the acquisition of data. Due to various reasons, I cannot accurately obtain the historical timetable route data limited to certain regions, because the interval of Opensky API requests can only be limited to within two hours. The accuracy of the obtained data and the reliability is not very high, there are cases of missing data (missing departure and arrival airports and callsign). Secondly, it only selects a specific research scope, and does not involve all the airports, airlines and routes in the UK, ignoring the possibility that there are many other airlines that undertake a large share of traffic in the UK. The research time is only selected for two weeks, ignoring the possibility that airlines will adjust their routes as the seasons change.
+
+When simulating the reorganized aviation network, only the shortest route is considered as an influencing factor, and factors such as the geographical location, scale, facilities, economy, and population of the new alternative airports are ignored. Secondly, the number of alternative airports to be selected is single. If conditions permit, an algorithm can be used to conduct a more comprehensive analysis, and the algorithm can be used to traverse each candidate target, and then comprehensively compare to find one or several airports with the best effect.
+
+When analyzing airlines, the number and types of choices are relatively small, because the central portal of the British air transport market also has a strong dependence on foreign airlines. Therefore, in the future, the introduction of more airline data for analysis can better clarify the competitive relationship between British airlines and other airlines, find their own advantages in airports in different cities, and ensure good ecological competition.
+
+# 7.Conclusion
+
+There are several findings of this project are as follows: the analysis concludes that London Heathrow is a highly connected airport and that the other airports (Belfast International, Edinburgh, London Gatwick, Glasgow International and Manchester) are not even half as capable as Heathrow in terms of degree centrality and median centrality. These airports are more similar in terms of their position in the network and the transport role they play, and are of comparable size, but still far less than the top ranked Heathrow airport. Assuming that Gatwick takes over the transport functions of Heathrow, it would still be slightly inferior to Belfast International in the new network, but given its position among the UK's many airports, its location and economic conditions, Gatwick is a very good choice. Of the 10 airlines, Easyjet has a large market share at the majority of UK airports, Eastern Airway is prevalent mainly in the South West and the Midlands of England has the largest variety of airlines involved.
+
+Based on this, Belfast International and Gatwick could be considered as both sharing the role of a transit hub at Heathrow, which could ease the vulnerability of Heathrow while attracting more routes into the UK and bringing more economic development opportunities. Regarding airline companies, those with geographical advantages should pay attention to the strategic position of core airports and use the hub role of core airports for route expansion; with regard to the overall uneven spatial distribution of aviation enterprises, attention should be paid to alleviating competition among enterprises in marginal areas and helping them to find their own advantageous position in order to avoid route shortages and vicious competition.
+
+\newpage
+
+# Reference
